@@ -6,6 +6,7 @@ import {
   FlatList,
   Image,
   Keyboard,
+  Modal,
   SafeAreaView,
   ScrollView,
   StatusBar,
@@ -26,19 +27,47 @@ import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 
 const Tab = createBottomTabNavigator();
 
-// ✅ .env’den geliyor (EXPO_PUBLIC_GEMINI_API_KEY)
 const GEMINI_API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY!;
-const STORAGE_KEY = 'ai_closet_v17';
+const STORAGE_KEY = 'ai_closet_v18_dark';
 
-/* -------------------- HELPERS -------------------- */
+/* -------------------- THEME HELPERS -------------------- */
+type WeatherKind = 'cold' | 'mild' | 'warm' | 'rainy';
+
+const getAccent = (weather: WeatherKind) => {
+  // Streetwear / dark: güçlü ama gözü yormayan accentler
+  if (weather === 'cold') return '#8AA4FF';
+  if (weather === 'mild') return '#4ECCA3';
+  if (weather === 'warm') return '#FF9F43';
+  return '#54A0FF'; // rainy
+};
+
+const getAccentGradient = (accent: string) => {
+  // Gradient için biraz koyu + accent
+  // (tek renk vermemek için)
+  return ['#111827', accent];
+};
+
+const getWeatherIcon = (weather: WeatherKind) => {
+  if (weather === 'cold') return 'snow';
+  if (weather === 'mild') return 'partly-sunny';
+  if (weather === 'warm') return 'sunny';
+  return 'rainy';
+};
+
+const getWeatherLabelTR = (weather: WeatherKind) => {
+  if (weather === 'cold') return 'Soğuk';
+  if (weather === 'mild') return 'Ilık';
+  if (weather === 'warm') return 'Sıcak';
+  return 'Yağışlı';
+};
+
+/* -------------------- JSON HELPERS -------------------- */
 const extractJsonSafe = (text: string) => {
   if (!text) return null;
-
   let cleaned = text.replace(/```json/gi, '').replace(/```/g, '').trim();
   const start = cleaned.indexOf('{');
   const end = cleaned.lastIndexOf('}');
   if (start === -1 || end === -1) return null;
-
   const jsonPart = cleaned.slice(start, end + 1);
   try {
     return JSON.parse(jsonPart);
@@ -53,13 +82,42 @@ const matchesWeather = (item: any, tag: string) => {
   return false;
 };
 
-// ✅ güvenli random
-const pickRandom = (arr: any[]) =>
-  arr.length === 0 ? null : arr[Math.floor(Math.random() * arr.length)];
+const pickRandom = (arr: any[]) => (arr.length ? arr[Math.floor(Math.random() * arr.length)] : null);
+
+
+// ---- Seeded random helpers ----
+
+
+
+const hashString = (s: string) => {
+  // basit, hızlı hash (deterministik)
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+};
+
+const mulberry32 = (seed: number) => {
+  return function () {
+    let t = (seed += 0x6D2B79F5);
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+};
+
+const pickSeeded = (arr: any[], seedKey: string) => {
+  if (!arr.length) return null;
+  const rng = mulberry32(hashString(seedKey));
+  const idx = Math.floor(rng() * arr.length);
+  return arr[idx];
+};
+
 
 /**
- * AI sonucu ne derse desin, biz burada kesin kuralları uygularız.
- * Özellikle shoes için:
+ * Shoes için kesin kurallar:
  * - sneaker -> cold,mild,warm
  * - boot -> cold,mild,rainy (warm ASLA yok)
  * - sandal -> warm
@@ -69,29 +127,24 @@ const normalizeAIResult = (parsed: any) => {
   const category = String(parsed?.category || '').toLowerCase().trim();
   const shoeType = parsed?.shoeType != null ? String(parsed.shoeType).toLowerCase().trim() : null;
 
-  // defaults
   if (!parsed.category) parsed.category = 'top';
   if (!Array.isArray(parsed.weatherTags)) parsed.weatherTags = ['mild'];
   if (parsed.shoeType === undefined) parsed.shoeType = null;
 
-  // normalize category values (defensive)
   const allowedCats = new Set(['top', 'bottom', 'outer', 'shoes']);
   if (!allowedCats.has(String(parsed.category).toLowerCase())) parsed.category = 'top';
 
-  // SHOES rules (hard override)
   if (String(parsed.category).toLowerCase() === 'shoes') {
     if (shoeType === 'sneaker') parsed.weatherTags = ['cold', 'mild', 'warm'];
-    else if (shoeType === 'boot') parsed.weatherTags = ['cold', 'mild', 'rainy']; // ✅ bot yağışta da olur, warm asla yok
+    else if (shoeType === 'boot') parsed.weatherTags = ['cold', 'mild', 'rainy'];
     else if (shoeType === 'sandal') parsed.weatherTags = ['warm'];
     else if (shoeType === 'rain_boot') parsed.weatherTags = ['rainy'];
     else {
-      // shoeType gelmediyse: pratik default (sneaker gibi)
       parsed.weatherTags = ['cold', 'mild', 'warm'];
       parsed.shoeType = 'sneaker';
     }
   }
 
-  // Deduplicate tags (optional)
   if (Array.isArray(parsed.weatherTags)) {
     parsed.weatherTags = Array.from(new Set(parsed.weatherTags.map((t: any) => String(t).toLowerCase())));
   }
@@ -112,6 +165,8 @@ function HomeScreen(props: any) {
     setLoading,
     shuffleKeyByCity,
     setShuffleKeyByCity,
+    globalAccent,
+    setGlobalAccent,
   } = props;
 
   const saveCloset = async (data: any[]) => {
@@ -119,8 +174,8 @@ function HomeScreen(props: any) {
     await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(data));
   };
 
-  // ✅ FIX: cool yok -> mild
-  const resolveWeather = (c: any): string => {
+  // cold/mild/warm + rainy
+  const resolveWeather = (c: any): WeatherKind => {
     if (c.isRainy) return 'rainy';
     if (c.temp < 15) return 'cold';
     if (c.temp < 25) return 'mild';
@@ -146,17 +201,22 @@ function HomeScreen(props: any) {
       );
       const wData = await wRes.json();
 
-      const temp = wData?.current_weather?.temperature;
+      const cw = wData?.current_weather;
 
       const newCity = {
         id: Date.now().toString(),
         name,
-        temp: typeof temp === 'number' ? temp : 0,
-        isRainy: (wData?.current_weather?.weathercode ?? 0) >= 51,
+        temp: typeof cw?.temperature === 'number' ? cw.temperature : 0,
+        isRainy: (cw?.weathercode ?? 0) >= 51,
+        time: cw?.time ?? null,          // ⬅️ SAAT
+        wind: cw?.windspeed ?? null,     // ⬅️ RÜZGÂR
       };
-
       setCityData((prev: any[]) => [newCity, ...prev]);
       setShuffleKeyByCity((prev: any) => ({ ...prev, [newCity.id]: 0 }));
+
+      // global accent: son eklenen şehir
+      const w = resolveWeather(newCity);
+      setGlobalAccent(getAccent(w));
 
       setCity('');
       Keyboard.dismiss();
@@ -255,7 +315,7 @@ Only JSON, no explanation.
         image: uri,
         category: ai.category,
         weatherTags: ai.weatherTags,
-        shoeType: ai.shoeType ?? null, // ✅ yeni alan
+        shoeType: ai.shoeType ?? null,
       };
 
       await saveCloset([newItem, ...closet]);
@@ -267,36 +327,38 @@ Only JSON, no explanation.
   };
 
   const generateOutfit = (weather: string, cityId: string) => {
-    // refresh dependency (Karıştır butonu)
-    const _ = shuffleKeyByCity[cityId] ?? 0;
+  const shuffleN = shuffleKeyByCity[cityId] ?? 0;
 
-    const allowed = weather === 'cold' ? ['cold', 'mild'] : [weather];
+  const allowed = weather === 'cold' ? ['cold', 'mild'] : [weather];
 
-    // weather filtre
-    const pool = closet.filter((c: any) => allowed.some((tag) => matchesWeather(c, tag)));
+  const pool = closet.filter((c: any) => allowed.some((tag) => matchesWeather(c, tag)));
 
-    const pick = (cat: string) => {
-      const items = pool.filter((c: any) => String(c.category).toLowerCase() === cat);
-      return pickRandom(items);
-    };
-
-    const top = pick('top');
-    const bottom = pick('bottom');
-
-    return {
-      top,
-      bottom,
-      outer: pick('outer'),
-      shoes: pick('shoes'),
-      missing: { top: !top, bottom: !bottom },
-    };
+  const pickCat = (cat: string) => {
+    const items = pool.filter((c: any) => String(c.category).toLowerCase() === cat);
+    // seedKey: şehir + hava + o şehrin shuffle sayısı + kategori
+    return pickSeeded(items, `${cityId}|${weather}|${shuffleN}|${cat}`);
   };
 
-  const shuffleForCity = (cityId: string) => {
+  const top = pickCat('top');
+  const bottom = pickCat('bottom');
+
+  return {
+    top,
+    bottom,
+    outer: pickCat('outer'),
+    shoes: pickCat('shoes'),
+    missing: { top: !top, bottom: !bottom },
+  };
+};
+
+
+  const shuffleForCity = (cityId: string, weather: WeatherKind) => {
     setShuffleKeyByCity((prev: any) => ({
       ...prev,
       [cityId]: (prev[cityId] ?? 0) + 1,
     }));
+    // global accent: o şehir üzerinden güncellensin
+    setGlobalAccent(getAccent(weather));
   };
 
   const removeCity = (id: string) => {
@@ -308,92 +370,137 @@ Only JSON, no explanation.
     });
   };
 
+  const headerGradient = useMemo(() => getAccentGradient(globalAccent), [globalAccent]);
+
   return (
     <View style={styles.container}>
       <StatusBar barStyle="light-content" />
 
-      <LinearGradient colors={['#1e3c72', '#2a5298']} style={styles.header}>
+      {/* AI Loading Overlay */}
+      <Modal visible={loading} transparent animationType="fade">
+        <View style={styles.overlay}>
+          <View style={styles.overlayCard}>
+            <ActivityIndicator size="large" color={globalAccent} />
+            <Text style={styles.overlayTitle}>AI analiz ediyor…</Text>
+            <Text style={styles.overlaySub}>Kıyafeti kategorize ediyor ve etiketliyor.</Text>
+          </View>
+        </View>
+      </Modal>
+
+      <LinearGradient colors={headerGradient as any} style={styles.header}>
         <SafeAreaView>
-          <Text style={styles.title}>AI Stil Asistanı</Text>
+          <Text style={styles.title}>OUTFIND</Text>
+          <Text style={styles.subtitle}>Find the fit for today.</Text>
 
           <View style={styles.searchBar}>
+            <Ionicons name="location-outline" size={18} color="#A7B0C0" style={{ marginRight: 8 }} />
             <TextInput
               style={styles.input}
               placeholder="Şehir Ara"
               value={city}
               onChangeText={setCity}
-              placeholderTextColor="#999"
+              placeholderTextColor="#73809A"
             />
-            <TouchableOpacity onPress={fetchWeather}>
-              <Ionicons name="search" size={22} color="#1e3c72" />
+            <TouchableOpacity onPress={fetchWeather} style={styles.searchBtn}>
+              <Ionicons name="search" size={18} color={globalAccent} />
             </TouchableOpacity>
           </View>
         </SafeAreaView>
       </LinearGradient>
 
       <View style={styles.actionRow}>
-        <Text style={styles.countText}>{closet.length} Kıyafet</Text>
-        <TouchableOpacity style={styles.addBtn} onPress={pickImage}>
-          {loading ? (
-            <ActivityIndicator color="#fff" />
-          ) : (
-            <Ionicons name="camera" size={20} color="#fff" />
-          )}
+        <View>
+          <Text style={styles.countText}>{closet.length} Kıyafet</Text>
+          <Text style={styles.countSub}>Dolabına parça ekleyip kombinleri güçlendir.</Text>
+        </View>
+
+        <TouchableOpacity style={[styles.addBtn, { borderColor: globalAccent }]} onPress={pickImage}>
+          <Ionicons name="camera" size={18} color={globalAccent} />
         </TouchableOpacity>
       </View>
 
       <FlatList
         data={cityData}
         keyExtractor={(i: any) => i.id}
-        contentContainerStyle={{ paddingBottom: 20 }}
+        contentContainerStyle={{ paddingBottom: 22 }}
         renderItem={({ item }: any) => {
           const weatherType = resolveWeather(item);
+          const accent = getAccent(weatherType);
           const outfit = generateOutfit(weatherType, item.id);
 
           return (
             <View style={styles.card}>
               <View style={styles.cardHeader}>
-                <View>
+                <View style={{ flex: 1 }}>
                   <Text style={styles.city}>{item.name}</Text>
-                  <Text style={styles.temp}>
-                    {Math.round(item.temp)}°C · {weatherType}
-                    {item.isRainy ? ' · Yağışlı' : ''}
-                  </Text>
-                </View>
+
+                  <View style={styles.row}>
+                    <View style={[styles.badge, { borderColor: accent, backgroundColor: '#0B1220' }]}>
+                      <Ionicons name={getWeatherIcon(weatherType) as any} size={14} color={accent} />
+                      <Text style={[styles.badgeText, { color: accent }]}>
+                        {getWeatherLabelTR(weatherType)}
+                      </Text>
+                    </View>
+
+                    <Text style={styles.temp}>
+                      {Math.round(item.temp)}°C
+                    </Text>
+                  </View>
+                    <View style={styles.metaWeatherRow}>
+                      <View style={styles.metaItem}>
+                        <Ionicons name="leaf-outline" size={14} color={accent} />
+                        <Text style={styles.metaText}>
+                          {item.wind != null ? `${Math.round(item.wind)} km/h` : '--'}
+                        </Text>
+                      </View>
+                    </View>
+                  </View>
 
                 <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                  <TouchableOpacity onPress={() => shuffleForCity(item.id)} style={styles.shuffleBtn}>
-                    <Ionicons name="shuffle" size={16} color="#fff" />
-                    <Text style={styles.shuffleText}>Karıştır</Text>
-                  </TouchableOpacity>
+                  <LinearGradient
+                    colors={getAccentGradient(accent) as any}
+                    start={{ x: 0, y: 0 }}
+                    end={{ x: 1, y: 0 }}
+                    style={[styles.shuffleBtn, { shadowColor: accent }]}
+                  >
+                    <TouchableOpacity onPress={() => shuffleForCity(item.id, weatherType)} style={styles.shufflePress}>
+                      <Ionicons name="shuffle" size={14} color="#EAF2FF" />
+                      <Text style={styles.shuffleText}>Karıştır</Text>
+                    </TouchableOpacity>
+                  </LinearGradient>
 
                   <TouchableOpacity onPress={() => removeCity(item.id)} style={{ marginLeft: 10 }}>
-                    <Ionicons name="trash" size={18} color="#e74c3c" />
+                    <Ionicons name="trash-outline" size={18} color="#FF5C5C" />
                   </TouchableOpacity>
                 </View>
               </View>
 
-              <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-                {outfit.top && <Image source={{ uri: outfit.top.image }} style={styles.img} />}
-                {outfit.bottom && <Image source={{ uri: outfit.bottom.image }} style={styles.img} />}
-                {outfit.outer && <Image source={{ uri: outfit.outer.image }} style={styles.img} />}
-                {outfit.shoes && <Image source={{ uri: outfit.shoes.image }} style={styles.img} />}
-              </ScrollView>
+              {/* Lookbook strip */}
+              <View style={styles.outfitRow}>
+                {outfit.top && <Image source={{ uri: outfit.top.image }} style={styles.outfitImg} />}
+                {outfit.bottom && <Image source={{ uri: outfit.bottom.image }} style={styles.outfitImg} />}
+                {outfit.outer && <Image source={{ uri: outfit.outer.image }} style={styles.outfitImg} />}
+                {outfit.shoes && <Image source={{ uri: outfit.shoes.image }} style={styles.outfitImg} />}
+              </View>
+
 
               {(outfit.missing.top || outfit.missing.bottom) && (
-                <Text style={styles.warn}>
-                  ⚠️ Daha iyi kombin için
-                  {outfit.missing.top && ' üst'}
-                  {outfit.missing.top && outfit.missing.bottom && ' ve'}
-                  {outfit.missing.bottom && ' alt'} ekle
-                </Text>
+                <View style={styles.warnBox}>
+                  <Ionicons name="alert-circle-outline" size={16} color={accent} />
+                  <Text style={styles.warn}>
+                    Daha iyi kombin için
+                    {outfit.missing.top && ' üst'}
+                    {outfit.missing.top && outfit.missing.bottom && ' ve'}
+                    {outfit.missing.bottom && ' alt'} ekle
+                  </Text>
+                </View>
               )}
             </View>
           );
         }}
         ListEmptyComponent={
           <View style={{ padding: 20 }}>
-            <Text style={{ color: '#666' }}>Şehir ekleyince hava durumu + kombin önerisi burada görünecek.</Text>
+            <Text style={{ color: '#A7B0C0' }}>Şehir ekleyince hava durumu + kombin önerisi burada görünecek.</Text>
           </View>
         }
       />
@@ -402,7 +509,7 @@ Only JSON, no explanation.
 }
 
 /* -------------------- CLOSET SCREEN + FILTERS -------------------- */
-function ClosetScreen({ closet, setCloset }: any) {
+function ClosetScreen({ closet, setCloset, globalAccent }: any) {
   const [selectedCat, setSelectedCat] = useState<'all' | 'top' | 'bottom' | 'outer' | 'shoes'>('all');
 
   const saveCloset = async (data: any[]) => {
@@ -412,7 +519,7 @@ function ClosetScreen({ closet, setCloset }: any) {
 
   const removeCloth = (id: string) => {
     Alert.alert('Sil', 'Bu kıyafeti silmek istiyor musun?', [
-      { text: 'İptal' },
+      { text: 'İptal', style: 'cancel' },
       {
         text: 'Sil',
         style: 'destructive',
@@ -441,14 +548,21 @@ function ClosetScreen({ closet, setCloset }: any) {
     return closet.filter((c: any) => String(c.category || '').toLowerCase() === selectedCat);
   }, [closet, selectedCat]);
 
+  const chipStyle = (active: boolean) => [
+    styles.chip,
+    active ? [styles.chipActive, { borderColor: globalAccent }] : styles.chipInactive,
+  ];
+
+  const chipTextStyle = (active: boolean) => [
+    styles.chipText,
+    active ? { color: globalAccent } : styles.chipTextInactive,
+  ];
+
   const FilterChip = ({ id, label, count }: any) => {
     const active = selectedCat === id;
     return (
-      <TouchableOpacity
-        onPress={() => setSelectedCat(id)}
-        style={[styles.chip, active ? styles.chipActive : styles.chipInactive]}
-      >
-        <Text style={[styles.chipText, active ? styles.chipTextActive : styles.chipTextInactive]}>
+      <TouchableOpacity onPress={() => setSelectedCat(id)} style={chipStyle(active)}>
+        <Text style={chipTextStyle(active)}>
           {label} ({count})
         </Text>
       </TouchableOpacity>
@@ -459,13 +573,12 @@ function ClosetScreen({ closet, setCloset }: any) {
     <View style={styles.container}>
       <StatusBar barStyle="light-content" />
 
-      <LinearGradient colors={['#1e3c72', '#2a5298']} style={styles.headerSmall}>
+      <LinearGradient colors={getAccentGradient(globalAccent) as any} style={styles.headerSmall}>
         <SafeAreaView>
           <Text style={styles.title}>Dolabım</Text>
         </SafeAreaView>
       </LinearGradient>
 
-      {/* Filters */}
       <View style={styles.filtersWrap}>
         <ScrollView horizontal showsHorizontalScrollIndicator={false}>
           <FilterChip id="all" label="All" count={counts.all} />
@@ -482,38 +595,59 @@ function ClosetScreen({ closet, setCloset }: any) {
 
       {closet.length === 0 ? (
         <View style={{ padding: 20 }}>
-          <Text style={{ color: '#666' }}>Henüz kıyafet eklemedin.</Text>
+          <Text style={{ color: '#A7B0C0' }}>Henüz kıyafet eklemedin.</Text>
         </View>
       ) : filteredCloset.length === 0 ? (
         <View style={{ padding: 20 }}>
-          <Text style={{ color: '#666' }}>Bu kategoride kıyafet yok.</Text>
+          <Text style={{ color: '#A7B0C0' }}>Bu kategoride kıyafet yok.</Text>
         </View>
       ) : (
         <FlatList
           data={filteredCloset}
           keyExtractor={(i: any) => i.id}
-          contentContainerStyle={{ padding: 15, paddingBottom: 30 }}
+          contentContainerStyle={{ padding: 14, paddingBottom: 30 }}
           numColumns={2}
-          renderItem={({ item }: any) => (
-            <View style={styles.closetCard}>
-              <TouchableOpacity style={styles.deleteIcon} onPress={() => removeCloth(item.id)}>
-                <Ionicons name="close-circle" size={20} color="#e74c3c" />
-              </TouchableOpacity>
+          renderItem={({ item }: any) => {
+            const cat = String(item.category || '').toLowerCase();
+            const tags = Array.isArray(item.weatherTags) ? item.weatherTags : [];
 
-              <Image source={{ uri: item.image }} style={styles.closetImg} />
+            // küçük badge accent: ilk tag'e göre (varsa)
+            const badgeWeather: WeatherKind =
+              tags.includes('rainy')
+                ? 'rainy'
+                : tags.includes('warm')
+                ? 'warm'
+                : tags.includes('cold')
+                ? 'cold'
+                : 'mild';
+            const accent = getAccent(badgeWeather);
 
-              <Text style={styles.meta}>{String(item.category || '').toUpperCase()}</Text>
+            return (
+              <View style={styles.closetCard}>
+                <TouchableOpacity style={styles.deleteIcon} onPress={() => removeCloth(item.id)}>
+                  <Ionicons name="close-circle" size={20} color="#FF5C5C" />
+                </TouchableOpacity>
 
-              {/* Shoes detail */}
-              {String(item.category || '').toLowerCase() === 'shoes' && (
-                <Text style={styles.metaSub}>
-                  {String(item.shoeType || 'unknown')}
-                </Text>
-              )}
+                <Image source={{ uri: item.image }} style={styles.closetImg} />
 
-              <Text style={styles.metaSub}>{(item.weatherTags || []).join(', ')}</Text>
-            </View>
-          )}
+                <View style={styles.metaRow}>
+                  <View style={[styles.miniPill, { borderColor: accent }]}>
+                    <Text style={[styles.miniPillText, { color: accent }]}>{cat.toUpperCase()}</Text>
+                  </View>
+
+                  {cat === 'shoes' && (
+                    <View style={[styles.miniPill, { borderColor: '#2B3750' }]}>
+                      <Text style={[styles.miniPillText, { color: '#C8D2E3' }]}>
+                        {(item.shoeType || 'unknown').toUpperCase()}
+                      </Text>
+                    </View>
+                  )}
+                </View>
+
+                <Text style={styles.metaSub}>{tags.join(', ')}</Text>
+              </View>
+            );
+          }}
         />
       )}
     </View>
@@ -527,6 +661,9 @@ export default function App() {
   const [closet, setCloset] = useState([]);
   const [loading, setLoading] = useState(false);
   const [shuffleKeyByCity, setShuffleKeyByCity] = useState({} as Record<string, number>);
+
+  // Global accent: default mild
+  const [globalAccent, setGlobalAccent] = useState(getAccent('mild'));
 
   useEffect(() => {
     (async () => {
@@ -543,8 +680,9 @@ export default function App() {
     <Tab.Navigator
       screenOptions={({ route }) => ({
         headerShown: false,
-        tabBarActiveTintColor: '#1e3c72',
-        tabBarInactiveTintColor: '#777',
+        tabBarStyle: styles.tabBar,
+        tabBarActiveTintColor: globalAccent,
+        tabBarInactiveTintColor: '#7C8AA5',
         tabBarIcon: ({ color, size }) => {
           const icon = route.name === 'Ana Sayfa' ? 'home' : 'shirt';
           return <Ionicons name={icon as any} size={size} color={color} />;
@@ -564,12 +702,14 @@ export default function App() {
             setLoading={setLoading}
             shuffleKeyByCity={shuffleKeyByCity}
             setShuffleKeyByCity={setShuffleKeyByCity}
+            globalAccent={globalAccent}
+            setGlobalAccent={setGlobalAccent}
           />
         )}
       </Tab.Screen>
 
       <Tab.Screen name="Dolabım">
-        {() => <ClosetScreen closet={closet} setCloset={setCloset} />}
+        {() => <ClosetScreen closet={closet} setCloset={setCloset} globalAccent={globalAccent} />}
       </Tab.Screen>
     </Tab.Navigator>
   );
@@ -577,69 +717,233 @@ export default function App() {
 
 /* -------------------- STYLES -------------------- */
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#f5f6fa' },
+  container: { flex: 1, backgroundColor: '#050A14' },
 
   header: {
     padding: 20,
     paddingBottom: 40,
-    borderBottomLeftRadius: 30,
-    borderBottomRightRadius: 30,
+    paddingTop: 48,
+    borderBottomLeftRadius: 26,
+    borderBottomRightRadius: 26,
   },
   headerSmall: {
     padding: 20,
-    paddingBottom: 20,
-    borderBottomLeftRadius: 30,
-    borderBottomRightRadius: 30,
+    paddingBottom: 18,
+    borderBottomLeftRadius: 26,
+    borderBottomRightRadius: 26,
   },
 
-  title: { color: '#fff', fontSize: 24, fontWeight: 'bold', textAlign: 'center' },
+  title: {
+    color: '#EAF2FF',
+    fontSize: 22,
+    fontWeight: '900',
+    textAlign: 'center',
+    letterSpacing: 0.6,
+    marginTop: 8,
+  },
 
+  subtitle: {
+  color: '#A7B0C0',
+  fontSize: 12,
+  fontWeight: '700',
+  textAlign: 'center',
+  marginTop: 4,
+  letterSpacing: 0.4,
+ },
+ 
   searchBar: {
-    backgroundColor: '#fff',
-    borderRadius: 12,
+    backgroundColor: '#0B1220',
+    borderRadius: 14,
     flexDirection: 'row',
     alignItems: 'center',
-    padding: 10,
-    marginTop: 20,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    marginTop: 16,
+    borderWidth: 1,
+    borderColor: '#1B2740',
   },
-  input: { flex: 1, color: '#000' },
+  input: { flex: 1, color: '#EAF2FF', fontWeight: '700' },
+  searchBtn: {
+    padding: 8,
+    borderRadius: 10,
+    backgroundColor: '#0A0F1C',
+    borderWidth: 1,
+    borderColor: '#1B2740',
+  },
 
-  actionRow: { flexDirection: 'row', justifyContent: 'space-between', padding: 20, alignItems: 'center' },
-  countText: { fontWeight: '700', color: '#333' },
-  addBtn: { backgroundColor: '#4ECCA3', padding: 12, borderRadius: 12 },
+  actionRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingTop: 14,
+    paddingBottom: 8,
+    alignItems: 'center',
+  },
+  countText: { fontWeight: '900', color: '#EAF2FF', fontSize: 14 },
+  countSub: { color: '#A7B0C0', fontWeight: '600', marginTop: 4, fontSize: 12 },
+  addBtn: {
+    width: 46,
+    height: 46,
+    borderRadius: 14,
+    backgroundColor: '#0B1220',
+    borderWidth: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
 
-  card: { backgroundColor: '#fff', marginHorizontal: 15, marginTop: 15, borderRadius: 20, padding: 15 },
+  card: {
+    backgroundColor: '#0B1220',
+    marginHorizontal: 14,
+    marginTop: 12,
+    borderRadius: 20,
+    padding: 14,
+    borderWidth: 1,
+    borderColor: '#13203A',
+  },
   cardHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' },
-  city: { fontSize: 18, fontWeight: 'bold' },
-  temp: { fontSize: 14, color: '#555', marginTop: 4 },
 
-  img: { width: 100, height: 130, borderRadius: 12, marginRight: 10, backgroundColor: '#eee' },
-  warn: { color: '#e67e22', marginTop: 8, fontSize: 12 },
+  city: { fontSize: 18, fontWeight: '900', color: '#EAF2FF' },
 
-  shuffleBtn: {
+  row: { flexDirection: 'row', alignItems: 'center', marginTop: 8 },
+
+  badge: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#1e3c72',
     paddingHorizontal: 10,
     paddingVertical: 6,
-    borderRadius: 10,
+    borderRadius: 999,
+    borderWidth: 1,
   },
-  shuffleText: { color: '#fff', fontWeight: '700', fontSize: 12, marginLeft: 6 },
+  badgeText: { marginLeft: 6, fontWeight: '900', fontSize: 12 },
+  temp: { marginLeft: 10, fontWeight: '900', color: '#C8D2E3', fontSize: 13 },
+
+  shuffleBtn: {
+    borderRadius: 14,
+    shadowOpacity: 0.35,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 8,
+  },
+  shufflePress: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 14,
+  },
+  shuffleText: { color: '#EAF2FF', fontWeight: '900', fontSize: 12, marginLeft: 6 },
+
+  metaWeatherRow: {
+  flexDirection: 'row',
+  alignItems: 'center',
+  marginTop: 6,
+  gap: 14,
+},
+
+metaItem: {
+  flexDirection: 'row',
+  alignItems: 'center',
+},
+
+metaText: {
+  marginLeft: 6,
+  color: '#C8D2E3',
+  fontWeight: '700',
+  fontSize: 12,
+},
+
+
+  // Lookbook images
+  outfitRow: {
+  flexDirection: 'row',
+  gap: 8,
+  marginTop: 12,
+},
+
+outfitImg: {
+  flex: 1,           // 4 parça eşit bölüşür
+  height: 120,       // küçült (şu an 150 civarı)
+  borderRadius: 14,
+  backgroundColor: '#0F172A',
+},
+
+  
+  imgBig: { width: 112, height: 150, borderRadius: 14, marginRight: 10, backgroundColor: '#0F172A' },
+  imgMid: { width: 98, height: 150, borderRadius: 14, marginRight: 10, backgroundColor: '#0F172A' },
+  imgShoe: { width: 84, height: 150, borderRadius: 14, marginRight: 10, backgroundColor: '#0F172A' },
+
+  warnBox: { flexDirection: 'row', alignItems: 'center', marginTop: 10 },
+  warn: { color: '#A7B0C0', marginLeft: 8, fontSize: 12, fontWeight: '700' },
 
   // Filters
-  filtersWrap: { paddingHorizontal: 15, paddingTop: 12, paddingBottom: 6 },
-  chip: { borderRadius: 999, paddingVertical: 8, paddingHorizontal: 12, marginRight: 10 },
-  chipActive: { backgroundColor: '#1e3c72' },
-  chipInactive: { backgroundColor: '#fff', borderWidth: 1, borderColor: '#d0d7e2' },
-  chipText: { fontWeight: '800', fontSize: 12 },
-  chipTextActive: { color: '#fff' },
-  chipTextInactive: { color: '#1e3c72' },
-  filterInfo: { marginTop: 8, color: '#555', fontWeight: '700', fontSize: 12 },
+  filtersWrap: { paddingHorizontal: 14, paddingTop: 10, paddingBottom: 6 },
+  chip: {
+    borderRadius: 999,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    marginRight: 10,
+    borderWidth: 1,
+  },
+  chipActive: { backgroundColor: '#0B1220' },
+  chipInactive: { backgroundColor: '#0B1220', borderColor: '#1B2740' },
+  chipText: { fontWeight: '900', fontSize: 12 },
+  chipTextInactive: { color: '#C8D2E3' },
+  filterInfo: { marginTop: 8, color: '#A7B0C0', fontWeight: '800', fontSize: 12 },
 
-  // Closet cards
-  closetCard: { flex: 1, backgroundColor: '#fff', borderRadius: 16, padding: 10, margin: 6 },
-  closetImg: { width: '100%', height: 180, borderRadius: 12, backgroundColor: '#eee' },
+  // Closet
+  closetCard: {
+    flex: 1,
+    backgroundColor: '#0B1220',
+    borderRadius: 18,
+    padding: 10,
+    margin: 6,
+    borderWidth: 1,
+    borderColor: '#13203A',
+  },
+  closetImg: { width: '100%', height: 175, borderRadius: 14, backgroundColor: '#0F172A' },
   deleteIcon: { position: 'absolute', right: 6, top: 6, zIndex: 2 },
-  meta: { marginTop: 8, fontWeight: '800', color: '#333', textAlign: 'center', fontSize: 12 },
-  metaSub: { marginTop: 2, color: '#666', textAlign: 'center', fontSize: 11 },
+
+  metaRow: { flexDirection: 'row', flexWrap: 'wrap', marginTop: 10 },
+  miniPill: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    borderWidth: 1,
+    marginRight: 8,
+    marginBottom: 8,
+    backgroundColor: '#0A0F1C',
+  },
+  miniPillText: { fontWeight: '900', fontSize: 11 },
+  metaSub: { color: '#A7B0C0', fontWeight: '700', fontSize: 11, marginTop: 2 },
+
+  // Tab bar
+  tabBar: {
+    backgroundColor: '#0B1220',
+    borderTopWidth: 1,
+    borderTopColor: '#13203A',
+    height: 60,
+    paddingBottom: 8,
+    paddingTop: 8,
+  },
+
+  // Loading overlay
+  overlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.72)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  overlayCard: {
+    width: '100%',
+    maxWidth: 360,
+    backgroundColor: '#0B1220',
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: '#13203A',
+    padding: 18,
+    alignItems: 'center',
+  },
+  overlayTitle: { color: '#EAF2FF', fontWeight: '900', fontSize: 16, marginTop: 12 },
+  overlaySub: { color: '#A7B0C0', fontWeight: '700', fontSize: 12, marginTop: 6, textAlign: 'center' },
 });
