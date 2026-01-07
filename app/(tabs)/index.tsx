@@ -28,13 +28,12 @@ import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 const Tab = createBottomTabNavigator();
 
 const GEMINI_API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY!;
-const STORAGE_KEY = 'ai_closet_v18_dark';
+const STORAGE_KEY = 'ai_closet_v19_rainfix'; // Versiyonu güncelledik
 
 /* -------------------- THEME HELPERS -------------------- */
 type WeatherKind = 'cold' | 'mild' | 'warm' | 'rainy';
 
 const getAccent = (weather: WeatherKind) => {
-  // Streetwear / dark: güçlü ama gözü yormayan accentler
   if (weather === 'cold') return '#8AA4FF';
   if (weather === 'mild') return '#4ECCA3';
   if (weather === 'warm') return '#FF9F43';
@@ -42,8 +41,6 @@ const getAccent = (weather: WeatherKind) => {
 };
 
 const getAccentGradient = (accent: string) => {
-  // Gradient için biraz koyu + accent
-  // (tek renk vermemek için)
   return ['#111827', accent];
 };
 
@@ -78,19 +75,14 @@ const extractJsonSafe = (text: string) => {
 
 const matchesWeather = (item: any, tag: string) => {
   if (Array.isArray(item.weatherTags)) return item.weatherTags.includes(tag);
-  if (item.weather) return item.weather === tag; // eski kayıtlar için
+  if (item.weather) return item.weather === tag;
   return false;
 };
 
 const pickRandom = (arr: any[]) => (arr.length ? arr[Math.floor(Math.random() * arr.length)] : null);
 
-
 // ---- Seeded random helpers ----
-
-
-
 const hashString = (s: string) => {
-  // basit, hızlı hash (deterministik)
   let h = 2166136261;
   for (let i = 0; i < s.length; i++) {
     h ^= s.charCodeAt(i);
@@ -115,14 +107,6 @@ const pickSeeded = (arr: any[], seedKey: string) => {
   return arr[idx];
 };
 
-
-/**
- * Shoes için kesin kurallar:
- * - sneaker -> cold,mild,warm
- * - boot -> cold,mild,rainy (warm ASLA yok)
- * - sandal -> warm
- * - rain_boot -> rainy
- */
 const normalizeAIResult = (parsed: any) => {
   const category = String(parsed?.category || '').toLowerCase().trim();
   const shoeType = parsed?.shoeType != null ? String(parsed.shoeType).toLowerCase().trim() : null;
@@ -174,7 +158,6 @@ function HomeScreen(props: any) {
     await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(data));
   };
 
-  // cold/mild/warm + rainy
   const resolveWeather = (c: any): WeatherKind => {
     if (c.isRainy) return 'rainy';
     if (c.temp < 15) return 'cold';
@@ -207,14 +190,13 @@ function HomeScreen(props: any) {
         id: Date.now().toString(),
         name,
         temp: typeof cw?.temperature === 'number' ? cw.temperature : 0,
-        isRainy: (cw?.weathercode ?? 0) >= 51,
-        time: cw?.time ?? null,          // ⬅️ SAAT
-        wind: cw?.windspeed ?? null,     // ⬅️ RÜZGÂR
+        isRainy: (cw?.weathercode ?? 0) >= 51, // 51 ve üzeri yağış kodları
+        time: cw?.time ?? null,
+        wind: cw?.windspeed ?? null,
       };
       setCityData((prev: any[]) => [newCity, ...prev]);
       setShuffleKeyByCity((prev: any) => ({ ...prev, [newCity.id]: 0 }));
 
-      // global accent: son eklenen şehir
       const w = resolveWeather(newCity);
       setGlobalAccent(getAccent(w));
 
@@ -226,6 +208,7 @@ function HomeScreen(props: any) {
   };
 
   const analyzeWithGemini = async (base64: string) => {
+    // SENİN İSTEDİĞİN MODELİ KORUDUM (2.5)
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${GEMINI_API_KEY}`;
 
     const payload = {
@@ -240,7 +223,7 @@ Return ONLY valid JSON:
 
 {
   "category": "top | bottom | outer | shoes",
-  "weatherTags": ["cold","mild"] | ["cold"] | ["mild"] | ["warm"] | ["rainy"] | ["cold","mild","warm"],
+  "weatherTags": ["cold","mild"] | ["cold"] | ["mild"] | ["warm"] | ["rainy"] | ["cold","mild","warm"] | ["cold","rainy"],
   "shoeType": "sneaker | boot | sandal | rain_boot | null"
 }
 
@@ -253,7 +236,7 @@ Rules:
 
 Weather tag rules for shoes:
 - sneaker → ["cold","mild","warm"]
-- boot → ["cold","mild","rainy"]   (NEVER include "warm")
+- boot → ["cold","mild","rainy"]
 - sandal → ["warm"]
 - rain_boot → ["rainy"]
 
@@ -261,9 +244,10 @@ Non-shoes:
 - Hoodies, sweatshirts, knitwear, fleece → ["cold","mild"]
 - Jeans / denim pants → ["cold","mild"]
 - T-shirts → ["warm"]
-- Jackets / coats → ["cold"]
+- Jackets / coats → ["cold", "rainy"] 
 - Raincoats → ["rainy"]
 
+IMPORTANT: If it is a jacket, coat or heavy outer, include "rainy" in tags if it looks usable in rain.
 Only JSON, no explanation.
 `,
             },
@@ -327,37 +311,39 @@ Only JSON, no explanation.
   };
 
   const generateOutfit = (weather: string, cityId: string) => {
-  const shuffleN = shuffleKeyByCity[cityId] ?? 0;
+    const shuffleN = shuffleKeyByCity[cityId] ?? 0;
 
-  const allowed = weather === 'cold' ? ['cold', 'mild'] : [weather];
+    // --- KRİTİK DÜZELTME BURADA ---
+    // Yağmurlu havada artık sadece "rainy" değil, "cold" ve "mild" kıyafetleri de havuza katıyoruz.
+    let allowed = [weather];
+    if (weather === 'cold') allowed = ['cold', 'mild'];
+    if (weather === 'rainy') allowed = ['rainy', 'cold', 'mild']; // <-- DÜZELTME: Yağmurda mont/sweat gelsin
 
-  const pool = closet.filter((c: any) => allowed.some((tag) => matchesWeather(c, tag)));
+    const pool = closet.filter((c: any) => allowed.some((tag) => matchesWeather(c, tag)));
 
-  const pickCat = (cat: string) => {
-    const items = pool.filter((c: any) => String(c.category).toLowerCase() === cat);
-    // seedKey: şehir + hava + o şehrin shuffle sayısı + kategori
-    return pickSeeded(items, `${cityId}|${weather}|${shuffleN}|${cat}`);
+    const pickCat = (cat: string) => {
+      const items = pool.filter((c: any) => String(c.category).toLowerCase() === cat);
+      // seedKey: şehir + hava + o şehrin shuffle sayısı + kategori
+      return pickSeeded(items, `${cityId}|${weather}|${shuffleN}|${cat}`);
+    };
+
+    const top = pickCat('top');
+    const bottom = pickCat('bottom');
+
+    return {
+      top,
+      bottom,
+      outer: pickCat('outer'),
+      shoes: pickCat('shoes'),
+      missing: { top: !top, bottom: !bottom },
+    };
   };
-
-  const top = pickCat('top');
-  const bottom = pickCat('bottom');
-
-  return {
-    top,
-    bottom,
-    outer: pickCat('outer'),
-    shoes: pickCat('shoes'),
-    missing: { top: !top, bottom: !bottom },
-  };
-};
-
 
   const shuffleForCity = (cityId: string, weather: WeatherKind) => {
     setShuffleKeyByCity((prev: any) => ({
       ...prev,
       [cityId]: (prev[cityId] ?? 0) + 1,
     }));
-    // global accent: o şehir üzerinden güncellensin
     setGlobalAccent(getAccent(weather));
   };
 
@@ -376,7 +362,6 @@ Only JSON, no explanation.
     <View style={styles.container}>
       <StatusBar barStyle="light-content" />
 
-      {/* AI Loading Overlay */}
       <Modal visible={loading} transparent animationType="fade">
         <View style={styles.overlay}>
           <View style={styles.overlayCard}>
@@ -475,14 +460,12 @@ Only JSON, no explanation.
                 </View>
               </View>
 
-              {/* Lookbook strip */}
               <View style={styles.outfitRow}>
                 {outfit.top && <Image source={{ uri: outfit.top.image }} style={styles.outfitImg} />}
                 {outfit.bottom && <Image source={{ uri: outfit.bottom.image }} style={styles.outfitImg} />}
                 {outfit.outer && <Image source={{ uri: outfit.outer.image }} style={styles.outfitImg} />}
                 {outfit.shoes && <Image source={{ uri: outfit.shoes.image }} style={styles.outfitImg} />}
               </View>
-
 
               {(outfit.missing.top || outfit.missing.bottom) && (
                 <View style={styles.warnBox}>
@@ -611,7 +594,6 @@ function ClosetScreen({ closet, setCloset, globalAccent }: any) {
             const cat = String(item.category || '').toLowerCase();
             const tags = Array.isArray(item.weatherTags) ? item.weatherTags : [];
 
-            // küçük badge accent: ilk tag'e göre (varsa)
             const badgeWeather: WeatherKind =
               tags.includes('rainy')
                 ? 'rainy'
@@ -654,15 +636,12 @@ function ClosetScreen({ closet, setCloset, globalAccent }: any) {
   );
 }
 
-/* -------------------- APP (TABS) -------------------- */
 export default function App() {
   const [city, setCity] = useState('');
   const [cityData, setCityData] = useState([]);
   const [closet, setCloset] = useState([]);
   const [loading, setLoading] = useState(false);
   const [shuffleKeyByCity, setShuffleKeyByCity] = useState({} as Record<string, number>);
-
-  // Global accent: default mild
   const [globalAccent, setGlobalAccent] = useState(getAccent('mild'));
 
   useEffect(() => {
@@ -715,7 +694,6 @@ export default function App() {
   );
 }
 
-/* -------------------- STYLES -------------------- */
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#050A14' },
 
@@ -852,8 +830,6 @@ metaText: {
   fontSize: 12,
 },
 
-
-  // Lookbook images
   outfitRow: {
   flexDirection: 'row',
   gap: 8,
@@ -861,21 +837,15 @@ metaText: {
 },
 
 outfitImg: {
-  flex: 1,           // 4 parça eşit bölüşür
-  height: 120,       // küçült (şu an 150 civarı)
+  flex: 1,           
+  height: 120,       
   borderRadius: 14,
   backgroundColor: '#0F172A',
 },
 
-  
-  imgBig: { width: 112, height: 150, borderRadius: 14, marginRight: 10, backgroundColor: '#0F172A' },
-  imgMid: { width: 98, height: 150, borderRadius: 14, marginRight: 10, backgroundColor: '#0F172A' },
-  imgShoe: { width: 84, height: 150, borderRadius: 14, marginRight: 10, backgroundColor: '#0F172A' },
-
   warnBox: { flexDirection: 'row', alignItems: 'center', marginTop: 10 },
   warn: { color: '#A7B0C0', marginLeft: 8, fontSize: 12, fontWeight: '700' },
 
-  // Filters
   filtersWrap: { paddingHorizontal: 14, paddingTop: 10, paddingBottom: 6 },
   chip: {
     borderRadius: 999,
@@ -890,7 +860,6 @@ outfitImg: {
   chipTextInactive: { color: '#C8D2E3' },
   filterInfo: { marginTop: 8, color: '#A7B0C0', fontWeight: '800', fontSize: 12 },
 
-  // Closet
   closetCard: {
     flex: 1,
     backgroundColor: '#0B1220',
@@ -916,7 +885,6 @@ outfitImg: {
   miniPillText: { fontWeight: '900', fontSize: 11 },
   metaSub: { color: '#A7B0C0', fontWeight: '700', fontSize: 11, marginTop: 2 },
 
-  // Tab bar
   tabBar: {
     backgroundColor: '#0B1220',
     borderTopWidth: 1,
@@ -926,7 +894,6 @@ outfitImg: {
     paddingTop: 8,
   },
 
-  // Loading overlay
   overlay: {
     flex: 1,
     backgroundColor: 'rgba(0,0,0,0.72)',
