@@ -7,7 +7,7 @@
     "icon": "./assets/images/icon.png",
     "scheme": "havadurumuapp",
     "userInterfaceStyle": "automatic",
-    "newArchEnabled": true,
+    "newArchEnabled": false, 
     "ios": {
       "supportsTablet": true
     },
@@ -18,8 +18,12 @@
         "backgroundImage": "./assets/images/android-icon-background.png",
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
-      "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "edgeToEdgeEnabled": false,
+      "package": "com.anonymous.HavaDurumuApp",
+      "androidNavigationBar": {
+        "visible": "immersive",
+        "backgroundColor": "#00000000"
+      }
     },
     "web": {
       "output": "static",
@@ -37,6 +41,16 @@
           "dark": {
             "backgroundColor": "#000000"
           }
+        }
+      ],
+      "@react-native-community/datetimepicker",
+      [
+        "expo-navigation-bar",
+        {
+          "position": "absolute",
+          "visibility": "hidden",
+          "behavior": "inset-swipe",
+          "backgroundColor": "#00000000"
         }
       ]
     ],

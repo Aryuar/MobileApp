@@ -1,34 +1,37 @@
 // @ts-nocheck
 import React, { useEffect, useMemo, useState } from 'react';
 import {
-  ActivityIndicator,
-  Alert,
-  FlatList,
-  Image,
-  Keyboard,
-  Modal,
-  SafeAreaView,
-  ScrollView,
-  StatusBar,
-  StyleSheet,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View,
+    ActivityIndicator,
+    Alert,
+    FlatList,
+    Image,
+    Keyboard,
+    Modal,
+    Platform,
+    SafeAreaView,
+    ScrollView,
+    StatusBar,
+    StyleSheet,
+    Text,
+    TextInput,
+    TouchableOpacity,
+    View,
 } from 'react-native';
 
 import { Ionicons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import DateTimePicker from '@react-native-community/datetimepicker';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
 import { LinearGradient } from 'expo-linear-gradient';
+import * as NavigationBar from 'expo-navigation-bar'; // <-- YENİ EKLENDİ
 
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 
 const Tab = createBottomTabNavigator();
 
 const GEMINI_API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY!;
-const STORAGE_KEY = 'ai_closet_v19_rainfix'; // Versiyonu güncelledik
+const STORAGE_KEY = 'ai_closet_v19_rainfix';
 
 /* -------------------- THEME HELPERS -------------------- */
 type WeatherKind = 'cold' | 'mild' | 'warm' | 'rainy';
@@ -190,7 +193,7 @@ function HomeScreen(props: any) {
         id: Date.now().toString(),
         name,
         temp: typeof cw?.temperature === 'number' ? cw.temperature : 0,
-        isRainy: (cw?.weathercode ?? 0) >= 51, // 51 ve üzeri yağış kodları
+        isRainy: (cw?.weathercode ?? 0) >= 51,
         time: cw?.time ?? null,
         wind: cw?.windspeed ?? null,
       };
@@ -208,7 +211,6 @@ function HomeScreen(props: any) {
   };
 
   const analyzeWithGemini = async (base64: string) => {
-    // SENİN İSTEDİĞİN MODELİ KORUDUM (2.5)
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${GEMINI_API_KEY}`;
 
     const payload = {
@@ -313,17 +315,14 @@ Only JSON, no explanation.
   const generateOutfit = (weather: string, cityId: string) => {
     const shuffleN = shuffleKeyByCity[cityId] ?? 0;
 
-    // --- KRİTİK DÜZELTME BURADA ---
-    // Yağmurlu havada artık sadece "rainy" değil, "cold" ve "mild" kıyafetleri de havuza katıyoruz.
     let allowed = [weather];
     if (weather === 'cold') allowed = ['cold', 'mild'];
-    if (weather === 'rainy') allowed = ['rainy', 'cold', 'mild']; // <-- DÜZELTME: Yağmurda mont/sweat gelsin
+    if (weather === 'rainy') allowed = ['rainy', 'cold', 'mild'];
 
     const pool = closet.filter((c: any) => allowed.some((tag) => matchesWeather(c, tag)));
 
     const pickCat = (cat: string) => {
       const items = pool.filter((c: any) => String(c.category).toLowerCase() === cat);
-      // seedKey: şehir + hava + o şehrin shuffle sayısı + kategori
       return pickSeeded(items, `${cityId}|${weather}|${shuffleN}|${cat}`);
     };
 
@@ -636,6 +635,361 @@ function ClosetScreen({ closet, setCloset, globalAccent }: any) {
   );
 }
 
+
+
+/* -------------------- TRAVEL (RANGE PACKING LIST) -------------------- */
+const isValidDateStr = (s: string) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || '').trim());
+
+const dateToUTC = (s: string) => {
+  const [y, m, d] = String(s).trim().split('-').map((n) => Number(n));
+  return new Date(Date.UTC(y, (m || 1) - 1, d || 1));
+};
+
+const toYMDFromDate = (dt: Date) => {
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, '0');
+  const d = String(dt.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+};
+
+const dateOnlyUTC = (dt: Date) => {
+  return new Date(Date.UTC(dt.getFullYear(), dt.getMonth(), dt.getDate()));
+};
+
+const diffDaysInclusiveUTCFromDates = (start: Date, end: Date) => {
+  const a = dateOnlyUTC(start);
+  const b = dateOnlyUTC(end);
+  const ms = b.getTime() - a.getTime();
+  return Math.floor(ms / 86400000) + 1;
+};
+
+const diffDaysInclusiveUTC = (startStr: string, endStr: string) => {
+  const a = dateToUTC(startStr);
+  const b = dateToUTC(endStr);
+  const ms = b.getTime() - a.getTime();
+  return Math.floor(ms / 86400000) + 1;
+};
+
+const classifyDay = (day: { code: number; tMax: number; tMin: number; rain: number }): WeatherKind => {
+  const avg = (Number(day.tMax) + Number(day.tMin)) / 2;
+  const rain = Number(day.rain) || 0;
+  const code = Number(day.code) || 0;
+
+  const rainy = rain >= 1 || code >= 51;
+  if (rainy) return 'rainy';
+  if (avg <= 10) return 'cold';
+  if (avg <= 20) return 'mild';
+  return 'warm';
+};
+
+const dominantKind = (counts: { rainy: number; cold: number; mild: number; warm: number }): WeatherKind => {
+  if (counts.rainy > 0) return 'rainy';
+  const entries: Array<[WeatherKind, number]> = [
+    ['cold', counts.cold],
+    ['mild', counts.mild],
+    ['warm', counts.warm],
+    ['rainy', counts.rainy],
+  ];
+  entries.sort((a, b) => b[1] - a[1]);
+  return entries[0][0] || 'mild';
+};
+
+const buildPackingList = (tripDays: number, counts: { rainy: number; cold: number; mild: number; warm: number }) => {
+  const tops = Math.max(1, Math.ceil(tripDays * 0.7));
+  const bottoms = Math.max(1, Math.ceil(tripDays * 0.4));
+  const underwear = Math.max(1, tripDays);
+
+  const needsJacket = counts.cold + counts.mild > 0;
+  const needsWarmLayer = counts.cold > 0;
+  const needsRainGear = counts.rainy > 0;
+
+  const list = [
+    { id: 'tops', label: 'Üst (T-shirt / Sweat)', qty: tops },
+    { id: 'bottoms', label: 'Alt (Pantolon / Şort)', qty: bottoms },
+    { id: 'underwear', label: 'Çorap & İç giyim', qty: underwear },
+  ];
+
+  if (needsJacket) list.push({ id: 'jacket', label: 'Ceket / Mont', qty: 1 });
+  if (needsWarmLayer) list.push({ id: 'warm', label: 'Ek sıcak katman (Kazak/Hoodie)', qty: 1 });
+  if (needsRainGear) list.push({ id: 'rain', label: 'Yağmurluk / Şemsiye', qty: 1 });
+
+  list.push({ id: 'shoes', label: 'Ayakkabı', qty: needsRainGear ? 2 : 1 });
+
+  return list;
+};
+
+async function geocodeCity(name: string) {
+  const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(
+    name.trim()
+  )}&count=1&language=tr&format=json`;
+  const res = await fetch(url);
+  const data = await res.json();
+  const hit = data?.results?.[0];
+  if (!hit) throw new Error('Şehir bulunamadı');
+  return {
+    lat: hit.latitude,
+    lon: hit.longitude,
+    display: `${hit.name}${hit.admin1 ? `, ${hit.admin1}` : ''}${hit.country ? `, ${hit.country}` : ''}`,
+  };
+}
+
+async function fetchDailyForecast(lat: number, lon: number, start: string, end: string) {
+  const url =
+    `https://api.open-meteo.com/v1/forecast` +
+    `?latitude=${lat}&longitude=${lon}` +
+    `&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum` +
+    `&timezone=auto&start_date=${start}&end_date=${end}`;
+
+  const res = await fetch(url);
+  const data = await res.json();
+  const d = data?.daily;
+  if (!d?.time?.length) throw new Error('Forecast alınamadı');
+
+  return d.time.map((date: string, i: number) => ({
+    date,
+    code: d.weathercode[i],
+    tMax: d.temperature_2m_max[i],
+    tMin: d.temperature_2m_min[i],
+    rain: d.precipitation_sum[i],
+  }));
+}
+
+function TravelScreen({ globalAccent, setGlobalAccent }: any) {
+  const [destination, setDestination] = useState('');
+  const [startDate, setStartDate] = useState<Date>(new Date());
+  const [endDate, setEndDate] = useState<Date>(new Date(Date.now() + 2 * 86400000));
+  const [showStartPicker, setShowStartPicker] = useState(false);
+  const [showEndPicker, setShowEndPicker] = useState(false);
+  const [planning, setPlanning] = useState(false);
+
+  const [placeLabel, setPlaceLabel] = useState<string | null>(null);
+  const [summary, setSummary] = useState<any>(null);
+  const [packing, setPacking] = useState<any[]>([]);
+
+  const headerGradient = useMemo(() => getAccentGradient(globalAccent), [globalAccent]);
+
+  const planTrip = async () => {
+    const dest = destination.trim();
+    const s = toYMDFromDate(startDate);
+    const e = toYMDFromDate(endDate);
+
+    if (!dest) return Alert.alert('Eksik', 'Lütfen şehir gir.');
+
+    const days = diffDaysInclusiveUTCFromDates(startDate, endDate);
+    if (days <= 0) return Alert.alert('Hata', 'Bitiş tarihi başlangıçtan önce olamaz.');
+
+    if (days > 14) {
+      return Alert.alert('Çok Uzun Aralık', 'Şimdilik en fazla 14 günlük aralık seç.');
+    }
+
+    try {
+      setPlanning(true);
+
+      const geo = await geocodeCity(dest);
+      const daily = await fetchDailyForecast(geo.lat, geo.lon, s, e);
+
+      const counts = { rainy: 0, cold: 0, mild: 0, warm: 0 };
+      let minT = Infinity;
+      let maxT = -Infinity;
+
+      for (const d of daily) {
+        const kind = classifyDay(d);
+        counts[kind] += 1;
+        minT = Math.min(minT, Number(d.tMin));
+        maxT = Math.max(maxT, Number(d.tMax));
+      }
+
+      const dom = dominantKind(counts);
+      setGlobalAccent(getAccent(dom));
+
+      setPlaceLabel(geo.display);
+      setSummary({
+        days,
+        counts,
+        minTemp: Number.isFinite(minT) ? Math.round(minT) : null,
+        maxTemp: Number.isFinite(maxT) ? Math.round(maxT) : null,
+      });
+      setPacking(buildPackingList(days, counts));
+    } catch (err: any) {
+      Alert.alert('Hata', err?.message || 'Seyahat planı oluşturulamadı');
+    } finally {
+      setPlanning(false);
+    }
+  };
+
+  return (
+    <View style={styles.container}>
+      <StatusBar barStyle="light-content" />
+
+      <Modal visible={planning} transparent animationType="fade">
+        <View style={styles.overlay}>
+          <View style={styles.overlayCard}>
+            <ActivityIndicator size="large" color={globalAccent} />
+            <Text style={styles.overlayTitle}>Plan hazırlanıyor…</Text>
+            <Text style={styles.overlaySub}>Hava durumuna göre packing list çıkarılıyor.</Text>
+          </View>
+        </View>
+      </Modal>
+
+      <ScrollView
+        style={{ flex: 1 }}
+        contentContainerStyle={{ paddingBottom: 40 }}
+        keyboardShouldPersistTaps="handled"
+      >
+        <LinearGradient colors={headerGradient as any} style={styles.headerSmall}>
+          <SafeAreaView>
+            <Text style={styles.title}>Seyahat</Text>
+            <Text style={styles.subtitle}>Tarih aralığına göre gerekli kıyafet listesi.</Text>
+          </SafeAreaView>
+        </LinearGradient>
+
+        <View style={{ paddingHorizontal: 14, paddingTop: 12 }}>
+          <Text style={styles.formLabel}>Şehir</Text>
+          <View style={styles.searchBar}>
+            <Ionicons name="navigate-outline" size={18} color="#A7B0C0" style={{ marginRight: 8 }} />
+            <TextInput
+              style={styles.input}
+              placeholder="Örn: Berlin"
+              value={destination}
+              onChangeText={setDestination}
+              placeholderTextColor="#73809A"
+              autoCapitalize="words"
+              returnKeyType="done"
+            />
+          </View>
+
+          <View style={styles.dateRow}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.formLabel}>Başlangıç</Text>
+              <TouchableOpacity
+                activeOpacity={0.85}
+                onPress={() => {
+                  Keyboard.dismiss();
+                  setShowStartPicker(true);
+                }}
+                style={styles.travelDateBtn}
+              >
+                <Ionicons name="calendar-outline" size={18} color="#A7B0C0" style={{ marginRight: 8 }} />
+                <Text style={styles.travelDateText}>{toYMDFromDate(startDate)}</Text>
+              </TouchableOpacity>
+            </View>
+
+            <View style={{ width: 10 }} />
+
+            <View style={{ flex: 1 }}>
+              <Text style={styles.formLabel}>Bitiş</Text>
+              <TouchableOpacity
+                activeOpacity={0.85}
+                onPress={() => {
+                  Keyboard.dismiss();
+                  setShowEndPicker(true);
+                }}
+                style={styles.travelDateBtn}
+              >
+                <Ionicons name="calendar-outline" size={18} color="#A7B0C0" style={{ marginRight: 8 }} />
+                <Text style={styles.travelDateText}>{toYMDFromDate(endDate)}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+
+          <TouchableOpacity onPress={planTrip} style={[styles.primaryBtn, { borderColor: globalAccent }]}>
+            <Ionicons name="checkmark-circle-outline" size={18} color={globalAccent} />
+            <Text style={[styles.primaryBtnText, { color: globalAccent }]}>Listeyi Oluştur</Text>
+          </TouchableOpacity>
+
+          {showStartPicker && (
+            <DateTimePicker
+              value={startDate}
+              mode="date"
+              display={Platform.OS === 'ios' ? 'spinner' : 'default'}
+              onChange={(event, selected) => {
+                if (Platform.OS !== 'ios') setShowStartPicker(false);
+                if (!selected) return;
+                const next = selected;
+                setStartDate(next);
+                if (next > endDate) setEndDate(next);
+              }}
+            />
+          )}
+
+          {showEndPicker && (
+            <DateTimePicker
+              value={endDate}
+              mode="date"
+              minimumDate={startDate}
+              display={Platform.OS === 'ios' ? 'spinner' : 'default'}
+              onChange={(event, selected) => {
+                if (Platform.OS !== 'ios') setShowEndPicker(false);
+                if (!selected) return;
+                setEndDate(selected);
+              }}
+            />
+          )}
+
+          {Platform.OS === 'ios' && (showStartPicker || showEndPicker) && (
+            <TouchableOpacity
+              onPress={() => {
+                setShowStartPicker(false);
+                setShowEndPicker(false);
+              }}
+              style={[styles.primaryBtn, { marginTop: 10, borderColor: '#1B2740' }]}
+            >
+              <Ionicons name="close-circle-outline" size={18} color="#A7B0C0" />
+              <Text style={[styles.primaryBtnText, { color: '#A7B0C0' }]}>Kapat</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+
+        {summary && (
+          <View style={styles.card}>
+            <Text style={styles.sectionTitle}>{placeLabel || 'Seçilen Şehir'}</Text>
+            <Text style={styles.sectionSub}>
+              {toYMDFromDate(startDate)} → {toYMDFromDate(endDate)} • {summary.days} gün • Min {summary.minTemp ?? '--'}°C /
+              Max {summary.maxTemp ?? '--'}°C
+            </Text>
+
+            <View style={styles.summaryRow}>
+              <View style={[styles.badge, { borderColor: getAccent('rainy'), backgroundColor: '#0B1220' }]}>
+                <Ionicons name="rainy" size={14} color={getAccent('rainy')} />
+                <Text style={[styles.badgeText, { color: getAccent('rainy') }]}>Yağışlı: {summary.counts.rainy}</Text>
+              </View>
+              <View style={[styles.badge, { borderColor: getAccent('cold'), backgroundColor: '#0B1220' }]}>
+                <Ionicons name="snow" size={14} color={getAccent('cold')} />
+                <Text style={[styles.badgeText, { color: getAccent('cold') }]}>Soğuk: {summary.counts.cold}</Text>
+              </View>
+              <View style={[styles.badge, { borderColor: getAccent('mild'), backgroundColor: '#0B1220' }]}>
+                <Ionicons name="partly-sunny" size={14} color={getAccent('mild')} />
+                <Text style={[styles.badgeText, { color: getAccent('mild') }]}>Ilık: {summary.counts.mild}</Text>
+              </View>
+              <View style={[styles.badge, { borderColor: getAccent('warm'), backgroundColor: '#0B1220' }]}>
+                <Ionicons name="sunny" size={14} color={getAccent('warm')} />
+                <Text style={[styles.badgeText, { color: getAccent('warm') }]}>Sıcak: {summary.counts.warm}</Text>
+              </View>
+            </View>
+
+            <View style={{ marginTop: 12 }}>
+              {packing.map((it) => (
+                <View key={it.id} style={styles.packingRow}>
+                  <Text style={styles.packingLabel}>{it.label}</Text>
+                  <Text style={[styles.packingQty, { color: globalAccent }]}>{it.qty}x</Text>
+                </View>
+              ))}
+            </View>
+          </View>
+        )}
+
+        {!summary && (
+          <View style={{ padding: 20 }}>
+            <Text style={{ color: '#A7B0C0' }}>
+              Şehir ve tarih aralığı seçince, o aralığın hava durumuna göre tek bir packing list çıkaracağım.
+            </Text>
+          </View>
+        )}
+      </ScrollView>
+    </View>
+  );
+}
+
 export default function App() {
   const [city, setCity] = useState('');
   const [cityData, setCityData] = useState([]);
@@ -643,6 +997,22 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [shuffleKeyByCity, setShuffleKeyByCity] = useState({} as Record<string, number>);
   const [globalAccent, setGlobalAccent] = useState(getAccent('mild'));
+
+  // --- YENİ EKLENEN KISIM: Navigasyon Barını Gizle ---
+  useEffect(() => {
+    async function configureBar() {
+      // Barı gizler (kaydırınca gelir, sonra geri gider)
+      await NavigationBar.setVisibilityAsync("hidden");
+      
+      // Kaydırıp açıldığında arka planı şeffaf olsun (isteğe bağlı)
+      await NavigationBar.setBackgroundColorAsync("transparent");
+      
+      // Geçici olarak üstte görünsün (immersive mod)
+      await NavigationBar.setBehaviorAsync("overlay-swipe");
+    }
+    configureBar();
+  }, []);
+  // ----------------------------------------------------
 
   useEffect(() => {
     (async () => {
@@ -663,7 +1033,7 @@ export default function App() {
         tabBarActiveTintColor: globalAccent,
         tabBarInactiveTintColor: '#7C8AA5',
         tabBarIcon: ({ color, size }) => {
-          const icon = route.name === 'Ana Sayfa' ? 'home' : 'shirt';
+          const icon = route.name === 'Ana Sayfa' ? 'home' : route.name === 'Seyahat' ? 'airplane' : 'shirt';
           return <Ionicons name={icon as any} size={size} color={color} />;
         },
       })}
@@ -685,6 +1055,10 @@ export default function App() {
             setGlobalAccent={setGlobalAccent}
           />
         )}
+      </Tab.Screen>
+
+      <Tab.Screen name="Seyahat">
+        {() => <TravelScreen globalAccent={globalAccent} setGlobalAccent={setGlobalAccent} />}
       </Tab.Screen>
 
       <Tab.Screen name="Dolabım">
@@ -885,6 +1259,47 @@ outfitImg: {
   miniPillText: { fontWeight: '900', fontSize: 11 },
   metaSub: { color: '#A7B0C0', fontWeight: '700', fontSize: 11, marginTop: 2 },
 
+
+
+  /* --- Travel --- */
+  formLabel: { color: '#A7B0C0', fontWeight: '800', fontSize: 12, marginTop: 10, marginBottom: 6 },
+  dateRow: { flexDirection: 'row', alignItems: 'flex-start', marginTop: 6 },
+  travelDateBtn: {
+    backgroundColor: '#0B1220',
+    borderRadius: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    borderWidth: 1,
+    borderColor: '#1B2740',
+  },
+  travelDateText: { flex: 1, color: '#EAF2FF', fontWeight: '800' },
+  primaryBtn: {
+    marginTop: 12,
+    backgroundColor: '#0B1220',
+    borderWidth: 1,
+    borderRadius: 14,
+    paddingVertical: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  primaryBtnText: { fontWeight: '900', fontSize: 14 },
+  sectionTitle: { color: '#EAF2FF', fontWeight: '900', fontSize: 16 },
+  sectionSub: { color: '#A7B0C0', fontWeight: '700', fontSize: 12, marginTop: 6 },
+  summaryRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 12 },
+  packingRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 10,
+    borderTopWidth: 1,
+    borderTopColor: '#13203A',
+  },
+  packingLabel: { color: '#C8D2E3', fontWeight: '800', fontSize: 13 },
+  packingQty: { fontWeight: '900', fontSize: 14 },
   tabBar: {
     backgroundColor: '#0B1220',
     borderTopWidth: 1,
